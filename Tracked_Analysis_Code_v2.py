@@ -11,12 +11,11 @@ from scipy.signal import argrelextrema
 from scipy.interpolate import interp1d
 
 
-WINDOW_LENGTH = 20
-TF=0.0 #movement detection thresold factor
+WINDOW_LENGTH = 30
 CILIA_COL='Cilia_EndPoint_Y_um'
 ACTUATOR_COL='Actuator_ymin_um'
 TIME_COL='Time_s'
-HILBERT_REMOVE=20
+HILBERT_REMOVE=30
 
 
 
@@ -92,31 +91,39 @@ def detect_actuator_activity_segments(df: pd.DataFrame,
     for i in range(1, len(is_active)):
         if is_active[i] != curr_type:
             end_idx = i
+            safe_start = start_idx if start_idx == 0 else start_idx + window_size
+            safe_end = end_idx - window_size
+            if safe_end <= safe_start:
+                continue  # skip segments that are too short
             s = {
                 'type': 'high' if curr_type else 'low',
-                'start_time': times[start_idx],
-                'end_time': times[end_idx + window_size - 1] if (end_idx + window_size - 1 < len(times)) else times[-1],
-                'cilia_times': times[start_idx + window_size // 2:end_idx + window_size // 2],
-                'cilia_values': cilia[start_idx + window_size // 2:end_idx + window_size // 2],
+                'start_time': times[safe_start],
+                'end_time': times[safe_end],
+                'cilia_times': times[safe_start:safe_end],
+                'cilia_values': cilia[safe_start:safe_end],
             }
-            if curr_type:  # Only add actuator for active segments
-                s['actuator_values'] = actuator[start_idx + window_size // 2:end_idx + window_size // 2]
+            if curr_type:  # Only for 'high' segments
+                s['actuator_values'] = actuator[safe_start:safe_end]
             segments.append(s)
             start_idx = i
             curr_type = is_active[i]
 
     # Add last segment
     end_idx = len(is_active)
-    s = {
-        'type': 'high' if curr_type else 'low',
-        'start_time': times[start_idx],
-        'end_time': times[-1],
-        'cilia_times': times[start_idx + window_size // 2:],
-        'cilia_values': cilia[start_idx + window_size // 2:],
-    }
-    if curr_type:
-        s['actuator_values'] = actuator[start_idx + window_size // 2:]
-    segments.append(s)
+    safe_start = start_idx + window_size  # margin at start
+    safe_end = len(times)  # no end margin needed here
+
+    if safe_end > safe_start:
+        s = {
+            'type': 'high' if curr_type else 'low',
+            'start_time': times[safe_start],
+            'end_time': times[-1],
+            'cilia_times': times[safe_start:safe_end],
+            'cilia_values': cilia[safe_start:safe_end],
+        }
+        if curr_type:
+            s['actuator_values'] = actuator[safe_start:safe_end]
+        segments.append(s)
 
     # --- Debug plot ---
     if debug:
@@ -191,13 +198,16 @@ def process_signal(t,v,flat_tol=0.001,res_spacing_tol=0.35,debug=False,smooth_we
     t = np.asarray(t)
     v = np.asarray(v)
 
+    #v, peak_freq = fourier_denoise(v,t[1]-t[0],f_rel_low=0.3,f_rel_high=3.7, debug=False)
+
     minima_t = []
     minima_v = []
 
+    mean_v = np.mean(v)
     i = 1
     while i < len(v) - 1:
         # Case 1: standard local minimum
-        if v[i - 1] > v[i] < v[i + 1]:
+        if v[i - 1] > v[i] < v[i + 1] and v[i] < mean_v:
             minima_t.append(t[i])
             minima_v.append(v[i])
             i += 1
@@ -207,9 +217,9 @@ def process_signal(t,v,flat_tol=0.001,res_spacing_tol=0.35,debug=False,smooth_we
             while i + 1 < len(v) and np.isclose(v[i], v[i + 1], rtol=flat_tol):
                 i += 1
             end = i
-            if end + 1 < len(v) and v[end + 1] > v[end]:
+            flat_v = v[start:end + 1].mean()
+            if end + 1 < len(v) and v[end + 1] > v[end] and flat_v < mean_v:
                 flat_t = t[start:end + 1].mean()
-                flat_v = v[start:end + 1].mean()
                 minima_t.append(flat_t)
                 minima_v.append(flat_v)
             i += 1
@@ -293,6 +303,9 @@ def process_signal(t,v,flat_tol=0.001,res_spacing_tol=0.35,debug=False,smooth_we
 
     filtered_t = np.array(filtered_t)
     filtered_v = np.array(filtered_v)
+    if len(filtered_t)<1:
+        print('no filtered')
+        return None
 
     if debug:
         # --- Plot signal and detected minima ---
@@ -604,8 +617,8 @@ def plot_analysis( c_data, b_data):
         # Step 4: Compute deviations from linear trend
         dev_c = phase_c_common - 2 * np.pi * c_data["freq_phase"] * (t_common - t_common[0]) - phase_c_common[0]
         dev_b = phase_b_common - 2 * np.pi * b_data["freq_phase"] * (t_common - t_common[0]) - phase_b_common[0]
-        diff = dev_c - dev_b
-
+        diff = phase_c_common - phase_b_common
+        diff=diff-np.mean(diff)
         # Plot
         plt.plot(t_common, dev_b, color='orange', label='B phase change')
         plt.plot(t_common, diff, color='blue', label='C phase - B phase')
@@ -677,7 +690,7 @@ def plot_analysis( c_data, b_data):
         hist_vals, bin_edges = np.histogram(angles, bins=bins, range=(0, 2*np.pi))
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
         ax2.bar(bin_centers, hist_vals, width=2*np.pi/bins, color='orange', edgecolor='black')
-        ax2.set_title("Polar Histogram: Actuator Phase")
+        ax2.set_title("Polar Histogram: Actuator Phase@ Cilia Minima")
 
         plt.tight_layout()
         plt.show()
@@ -698,31 +711,23 @@ def analyze_before_after_beam_oscillation(
     )
     print(f"{filename}: detected {len(segments)} segments")
  
-    # --- Split data and analyze ---
-    split_index = np.searchsorted(df[TIME_COL].values, split_time)
-    # --- Split data and analyze ---
-    before_time = df[TIME_COL].values[:split_index]
-    after_time = df[TIME_COL].values[split_index:]
-    before_cilia = df[CILIA_COL].values[:split_index]
-    after_cilia = df[CILIA_COL].values[split_index:]
-    after_actuator = df[ACTUATOR_COL].values[split_index:]
-    # Process signals with time and value
-    before_c = process_signal(before_time, before_cilia) #change maybe because of better tracking
-    after_c = process_signal(after_time, after_cilia)
-    after_b = process_signal_actuator(after_time, after_actuator)
 
-    
-    # --- Plot results ---
-    if show_plots:
-        if before_c :
-            plot_analysis(
-                before_c, None
-            )
-        if after_c and after_b:
-            plot_analysis(
-                after_c, after_b
-            )
+    for i, seg in enumerate(segments):
+        print(f"Segment {i+1}/{len(segments)}: {seg['type']} activity, t = {seg['start_time']:.2f}–{seg['end_time']:.2f}s")
 
+        # --- Process cilia ---
+        cilia_data = process_signal(seg['cilia_times'], seg['cilia_values'])
+        if cilia_data is None:
+            continue
+        # --- Process actuator if high activity ---
+        if seg['type'] == 'high':
+            actuator_data = process_signal_actuator(seg['cilia_times'], seg['actuator_values'])
+        else:
+            actuator_data = None
+
+        # --- Plot ---
+        if show_plots:
+            plot_analysis(cilia_data, actuator_data)
 
 
 def plot_full_tracked_before_after(filepath_pattern, show_plots=True):
