@@ -7,10 +7,12 @@ from numpy.lib.stride_tricks import sliding_window_view
 from powersmooth.powersmooth import powersmooth_general, upsample_with_mask
 from scipy.signal import hilbert
 from scipy.stats import gaussian_kde
+from scipy.signal import argrelextrema
+from scipy.interpolate import interp1d
 
-PTh=1.3 #phase thresold
-WINDOW_LENGTH = 5
-TF=0.3 #movement detection thresold factor
+
+WINDOW_LENGTH = 20
+TF=0.0 #movement detection thresold factor
 CILIA_COL='Cilia_EndPoint_Y_um'
 ACTUATOR_COL='Actuator_ymin_um'
 TIME_COL='Time_s'
@@ -19,55 +21,121 @@ HILBERT_REMOVE=20
 
 
 
-def detect_actuator_movement_start(df: pd.DataFrame,
-                                   window_size: int = 5,
-                                   threshold_factor: float = 3.0
-                                  ) -> float:
+def detect_actuator_activity_segments(df: pd.DataFrame,
+                                      window_size: int = 5,
+                                      debug: bool = False
+                                     ):
     """
-    Detect the onset of actuator movement in a 1D trace.
+    Detect continuous low- and high-activity segments in actuator movement
+    based on standard deviation threshold from bimodal std histogram.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Must contain columns ACTUATOR_COL and TIME_COL.
+        Must contain ACTUATOR_COL, TIME_COL, and CILIA_COL.
     window_size : int
         Number of frames per sliding window (must be < number of rows).
-    threshold_factor : float
-        Multiplier for baseline σ to set the detection threshold.
+    debug : bool
+        If True, display diagnostic plot.
 
     Returns
     -------
-    float
-        The time (in seconds) at the start of the first window
-        whose σ exceeds the threshold. Returns np.nan if no movement detected.
+    segments : List[Dict]
+        Each dict has keys:
+        - 'type' : 'low' or 'high'
+        - 'start_time', 'end_time' : float
+        - 'cilia_times', 'cilia_values' : np.ndarray
+        - 'actuator_values' : np.ndarray (only for 'high' segments)
     """
-    # Extract actuator displacement trace and time
     actuator = df[ACTUATOR_COL].to_numpy()
-    times    = df[TIME_COL].to_numpy()
-    n_t = actuator.shape[0]
+    times = df[TIME_COL].to_numpy()
+    cilia = df[CILIA_COL].to_numpy()
+
+    n_t = len(actuator)
     if window_size >= n_t:
         raise ValueError(f"window_size ({window_size}) must be smaller than total frames ({n_t})")
 
-    # Build sliding windows: shape → (n_windows, window_size)
-    windows = sliding_window_view(actuator, window_shape=window_size, axis=0)
-    # Compute std dev of each window
-    std_per_window = np.std(windows, axis=1)
+    # Compute sliding std dev
+    std_per_window = np.std(sliding_window_view(actuator, window_shape=window_size), axis=1)
 
-    # Define baseline and threshold
-    baseline     = np.median(std_per_window)
-    baseline_std = np.std(std_per_window)
-    thresh       = baseline + threshold_factor * baseline_std
+    # Estimate threshold via KDE valley detection
+    kde = gaussian_kde(std_per_window)
+    std_range = np.linspace(std_per_window.min(), std_per_window.max(), 1000)
+    density = kde(std_range)
 
-    # Find first window exceeding threshold
-    exceed = np.where(std_per_window > thresh)[0]
-    if exceed.size == 0:
-        # No movement detected
-        return np.nan
+    # Find local minima of KDE
+    minima_idx = argrelextrema(density, np.less)[0]
+    maxima_idx = argrelextrema(density, np.greater)[0]
 
-    # Map window index back to the corresponding time at window start
-    first_window_idx = int(exceed[0])
-    movement_time = times[first_window_idx]
-    return movement_time
+    if len(minima_idx) == 0 or len(maxima_idx) < 2:
+        raise RuntimeError("Could not detect bimodal distribution in std values.")
+
+    # Use minimum between the two largest maxima as threshold
+    peak_vals = density[maxima_idx]
+    top_two = np.argsort(peak_vals)[-2:]
+    peak_locs = np.sort(std_range[maxima_idx[top_two]])
+    thresh_candidates = std_range[minima_idx]
+    thresh = thresh_candidates[(thresh_candidates > peak_locs[0]) & (thresh_candidates < peak_locs[1])]
+
+    if len(thresh) == 0:
+        raise RuntimeError("No threshold found between KDE peaks.")
+    thresh = thresh[0]
+
+    # Classify windows
+    is_active = std_per_window > thresh
+
+    # Identify contiguous segments
+    segments = []
+    curr_type = is_active[0]
+    start_idx = 0
+
+    for i in range(1, len(is_active)):
+        if is_active[i] != curr_type:
+            end_idx = i
+            s = {
+                'type': 'high' if curr_type else 'low',
+                'start_time': times[start_idx],
+                'end_time': times[end_idx + window_size - 1] if (end_idx + window_size - 1 < len(times)) else times[-1],
+                'cilia_times': times[start_idx + window_size // 2:end_idx + window_size // 2],
+                'cilia_values': cilia[start_idx + window_size // 2:end_idx + window_size // 2],
+            }
+            if curr_type:  # Only add actuator for active segments
+                s['actuator_values'] = actuator[start_idx + window_size // 2:end_idx + window_size // 2]
+            segments.append(s)
+            start_idx = i
+            curr_type = is_active[i]
+
+    # Add last segment
+    end_idx = len(is_active)
+    s = {
+        'type': 'high' if curr_type else 'low',
+        'start_time': times[start_idx],
+        'end_time': times[-1],
+        'cilia_times': times[start_idx + window_size // 2:],
+        'cilia_values': cilia[start_idx + window_size // 2:],
+    }
+    if curr_type:
+        s['actuator_values'] = actuator[start_idx + window_size // 2:]
+    segments.append(s)
+
+    # --- Debug plot ---
+    if debug:
+        plt.figure(figsize=(10, 4))
+        plt.plot(times[:len(std_per_window)], std_per_window, label='Sliding STD', color='gray')
+        plt.axhline(thresh, color='red', linestyle='--', label=f'Threshold = {thresh:.3g}')
+        for seg in segments:
+            t0, t1 = seg['start_time'], seg['end_time']
+            color = 'green' if seg['type'] == 'low' else 'orange'
+            plt.axvspan(t0, t1, color=color, alpha=0.3)
+        plt.xlabel('Time (s)')
+        plt.ylabel('STD (windowed)')
+        plt.title('Detected Activity Segments')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    return segments
+
 
 def plot_minima_spacing_histogram_kde(t_min, bins=30, bandwidth='scott', debug=False):
     """
@@ -623,46 +691,13 @@ def analyze_before_after_beam_oscillation(
     std_window_size=5,
 ):
     
-
-    # Initialize split_time using detect_movement_start
-    split_time = None
-
-    try:
-        split_time = detect_actuator_movement_start(
-            df,
-            window_size=std_window_size,
-            threshold_factor=TF  # Adjust based on your noise level
-        )
-        print(f"{filename}: Movement detected at {split_time:.2f}s ")
-    except Exception as e:
-        print(f"{filename}: Movement detection failed. Error: {e}")
-        split_time = None
-
-
-
-    # --- Plot activity trace from actuator signal for diagnostics ---
-    actuator = df[ACTUATOR_COL].to_numpy()
-    time     = df[TIME_COL].to_numpy()
-    # Compute sliding std dev activity
-    windows = sliding_window_view(actuator, window_shape=std_window_size, axis=0)
-    std_per_window = np.std(windows, axis=1)
-    # Threshold
-    baseline = np.median(std_per_window)
-    baseline_std = np.std(std_per_window)
-    thresh = baseline + TF * baseline_std
-    plt.figure(figsize=(10, 4))
-    plt.plot(time[:len(std_per_window)], std_per_window, label='STD Activity')
-    plt.axhline(thresh, color='r', linestyle='--', label='Threshold')
-    if not np.isnan(split_time):
-        plt.axvline(split_time, color='k', linestyle=':', label='Detected Onset')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Sliding Window STD')
-    plt.title(f'{filename}: Actuator Movement Detection')
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-
+    segments = detect_actuator_activity_segments(
+        df,
+        window_size=std_window_size,
+        debug=True
+    )
+    print(f"{filename}: detected {len(segments)} segments")
+ 
     # --- Split data and analyze ---
     split_index = np.searchsorted(df[TIME_COL].values, split_time)
     # --- Split data and analyze ---
@@ -672,7 +707,7 @@ def analyze_before_after_beam_oscillation(
     after_cilia = df[CILIA_COL].values[split_index:]
     after_actuator = df[ACTUATOR_COL].values[split_index:]
     # Process signals with time and value
-    before_c = process_signal(before_time, before_cilia)
+    before_c = process_signal(before_time, before_cilia) #change maybe because of better tracking
     after_c = process_signal(after_time, after_cilia)
     after_b = process_signal_actuator(after_time, after_actuator)
 
