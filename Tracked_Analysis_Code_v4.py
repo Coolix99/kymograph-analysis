@@ -7,10 +7,9 @@ from numpy.lib.stride_tricks import sliding_window_view
 from powersmooth.powersmooth import powersmooth_general, upsample_with_mask,powersmooth_upsample
 from scipy.signal import hilbert
 from scipy.stats import gaussian_kde
-from scipy.signal import argrelextrema
 from scipy.interpolate import interp1d
 from matplotlib.widgets import Slider
-
+from scipy.signal import argrelextrema, savgol_filter
 
 WINDOW_LENGTH = 30
 CILIA_COL='Cilia_EndPoint_Y_um'
@@ -42,13 +41,13 @@ def detect_actuator_activity_segments(df, window_size: int = 5):
     actuator = df[ACTUATOR_COL].to_numpy()
     cilia = df[CILIA_COL].to_numpy()
 
-    # 1) sliding‐window std
+    # sliding‐window std
     n = len(actuator)
     if window_size >= n:
         raise ValueError(f"window_size ({window_size}) must be < total frames ({n})")
     stds = np.std(sliding_window_view(actuator, window_size), axis=1)
 
-    # 2) threshold via KDE valley
+    # threshold via KDE valley
     kde = gaussian_kde(stds)
     grid = np.linspace(stds.min(), stds.max(), 1000)
     dens = kde(grid)
@@ -60,10 +59,10 @@ def detect_actuator_activity_segments(df, window_size: int = 5):
     bounds = np.sort(grid[maxs[peak2]])
     thresh = grid[mins][(grid[mins] > bounds[0]) & (grid[mins] < bounds[1])][0]
 
-    # 3) label active/inactive
+    # label active/inactive
     active = stds > thresh
 
-    # 4) find all segments
+    # find all segments
     segs = []
     curr, start = active[0], 0
     for i in range(1, len(active)):
@@ -94,7 +93,7 @@ def detect_actuator_activity_segments(df, window_size: int = 5):
             seg['actuator_values'] = actuator[start:]
         segs.append(seg)
 
-    # 5) pick main high + flanking lows
+    # pick main high + flanking lows
     highs = [s for s in segs if s['type']=='high']
     if not highs:
         raise RuntimeError("No high-activity found")
@@ -240,7 +239,7 @@ def plot_minima_spacing_histogram_kde(t_min, bins=30, bandwidth='scott', debug=F
 
     return spacings, peak_spacing
 
-def process_signal_cilia(t,v,flat_tol=0.001,res_spacing_tol=0.7,debug=False,smooth_weight=1e-16):
+def process_signal_cilia(t,v,flat_tol=0.001,debug=False,smooth_weight=1e-16):
     t = np.asarray(t)
     v_orig = np.asarray(v)
 
@@ -282,81 +281,9 @@ def process_signal_cilia(t,v,flat_tol=0.001,res_spacing_tol=0.7,debug=False,smoo
 
     _,peak_spacing=plot_minima_spacing_histogram_kde(minima_t)
 
-    spacing_tol = res_spacing_tol * peak_spacing
-    window_size = 7
-
     minima_t = np.array(minima_t)
     minima_v = np.array(minima_v)
 
-    # filtered_t = []
-    # filtered_v = []
-
-    # n_minima = len(minima_t)
-
-    # for i in range(n_minima):
-    #     # Define the window: centered at i (or as close as possible)
-    #     half = window_size // 2
-    #     start = max(0, i - half)
-    #     end = min(n_minima, start + window_size)
-    #     start = max(0, end - window_size)  # adjust in case of early boundary
-
-    #     # Skip if the window is too small
-    #     if end - start < window_size:
-    
-    #         continue
-
-    #     # Compute local offset and phase indices
-    #     window_t = np.concatenate((minima_t[start:i], minima_t[i+1:end]))
-    #     test_offsets = np.linspace(0, peak_spacing, 10, endpoint=False)
-    #     best_offset = None
-    #     min_residual = np.inf
-
-    #     for test_offset in test_offsets:
-    #         window_n = np.round((window_t - test_offset) / peak_spacing)
-    #         t_theory = window_n * peak_spacing + test_offset
-    #         residuals = np.abs(window_t - t_theory)
-    #         mean_res = np.mean(residuals)
-
-    #         if mean_res < min_residual:
-    #             min_residual = mean_res
-    #             best_offset = test_offset
-
-    #     # Use best offset
-    #     window_offset = best_offset
-        
-
-    #     # plt.figure(figsize=(8, 3))
-    #     # plt.scatter(window_t, np.concatenate((minima_v[start:i], minima_v[i+1:end])), color='blue', label='Local Minima')
-
-    #     # # Plot vertical lines at theoretical times
-    #     # for j in range(window_n.shape[0]):
-    #     #     n_i = np.round((window_t[j] - window_offset) / peak_spacing)
-    #     #     t_theo = n_i * peak_spacing + window_offset
-    #     #     plt.axvline(t_theo, color='black', linestyle='--', linewidth=0.7)
-
-    #     # plt.title(f"Sliding Window {start}–{end}")
-    #     # plt.xlabel("Time (s)")
-    #     # plt.ylabel("Signal")
-    #     # plt.legend()
-    #     # plt.tight_layout()
-    #     # plt.show()
-
-    #     # Check middle point only
-    #     t_i = minima_t[i]
-    #     v_i = minima_v[i]
-    #     n_i = np.round((t_i - window_offset) / peak_spacing)
-    #     t_theory = n_i * peak_spacing + window_offset
-
-    #     if abs(t_i - t_theory) <= spacing_tol:
-    #         # Only append if not already added (avoids duplicates at window overlaps)
-    #         if len(filtered_t) == 0 or t_i != filtered_t[-1]:
-    #             filtered_t.append(t_i)
-    #             filtered_v.append(v_i)
-
-
-    # filtered_t = np.array(filtered_t)
-    # filtered_v = np.array(filtered_v)
-    
 
     if debug:
         # --- Plot signal and detected minima ---
@@ -387,7 +314,6 @@ def process_signal_cilia(t,v,flat_tol=0.001,res_spacing_tol=0.7,debug=False,smoo
 
     phase_raw = np.array(final_phase)
 
-    
 
     n_phase = np.arange(len(minima_t))
     phase_raw = 2 * np.pi * n_phase  # Arbitrary phase assignment (e.g. 2π steps)
@@ -554,8 +480,6 @@ def compute_phase_from_protophi(protophi: np.ndarray, nharm: int = 10) -> np.nda
 
     return np.unwrap(np.real(phi))
 
-
-
 def process_signal_actuator(t,v):
     denoised, peak_freq = fourier_denoise(v,t[1]-t[0],f_rel_low=0.3,f_rel_high=1.7, debug=False)
     
@@ -699,317 +623,215 @@ def plot_analysis(c_data, b_data):
         plt.tight_layout()
         plt.show()
 
-
-
-def plot_psd_histogram_by_segment(cilia_segments, actuator_segments, dt):
+def plot_psd_histogram_by_segment(segments, dt):
     """
-    Plot normalized PSD curves for cilia and actuator across three segments
-    (Before, During, After), only in the frequency band [0.3·f_peak, 3.5·f_peak].
-    Each line is color‑coded by segment and labeled with its peak frequency.
+    Plot normalized PSD curves for cilia and actuator across multiple segments.
+    Low-activity (before/after) segments are shown in green,
+    high-activity subsegments are shown in gray (brightness ∝ mean distance).
+    Actuator PSDs are shown in red (overlaid).
+
+    Parameters
+    ----------
+    segments : list of dict
+        Output of split_distancebased_segments(), including 'low' and 'high' segments.
+        Each high segment must have 'actuator_values' and 'mean_distance'.
+    dt : float
+        Sampling interval (s).
     """
-    import matplotlib.pyplot as plt
     from scipy.fft import fft, fftfreq
-    segments = ['Before', 'During', 'After']
-    colors = ['C0', 'C1', 'C2']
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
 
-    fig, (ax_c, ax_a) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    # Separate low/high segments
+    lows = [s for s in segments if s['type'] == 'low']
+    highs = [s for s in segments if s['type'] == 'high']
 
-    # CILIA
-    for seg_name, cilia, color in zip(segments, cilia_segments, colors):
-        v = cilia - np.mean(cilia)
-        n = len(v)
+    # --- Compute PSD helper ---
+    def compute_norm_psd(signal, dt):
+        signal = np.asarray(signal) - np.mean(signal)
+        n = len(signal)
         freqs = fftfreq(n, d=dt)[:n//2]
-        psd = np.abs(fft(v))[:n//2]**2
+        psd = np.abs(fft(signal))[:n//2] ** 2
         f_peak = freqs[np.argmax(psd)]
         fmin, fmax = 0.3 * f_peak, 3.5 * f_peak
         mask = (freqs >= fmin) & (freqs <= fmax)
         freqs_m = freqs[mask]
         psd_m = psd[mask]
         area = np.trapz(psd_m, freqs_m)
-        psd_norm = psd_m / area
-        ax_c.plot(freqs_m, psd_norm, color=color, label=f'{seg_name}: {f_peak:.2f} Hz')
+        psd_norm = psd_m / area if area > 0 else psd_m
+        return freqs_m, psd_norm, f_peak
+
+    # --- Create figure ---
+    fig, (ax_c, ax_a) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+    # --- Cilia PSDs ---
+    cmap_gray = cm.get_cmap('Greys')
+    if highs:
+        dist_vals = np.array([h['mean_distance'] for h in highs])
+        # Normalize distances to [0.3, 0.9] gray levels
+        if np.ptp(dist_vals) == 0:
+            normed = np.full_like(dist_vals, 0.6)
+        else:
+            normed = 0.3 + 0.6 * (dist_vals - dist_vals.min()) / (dist_vals.max() - dist_vals.min())
+
+    # Before (low1)
+    if len(lows) >= 1:
+        freqs_m, psd_norm, f_peak = compute_norm_psd(lows[0]['cilia_values'], dt)
+        ax_c.plot(freqs_m, psd_norm, color='green', lw=2, label=f'Before: {f_peak:.2f} Hz')
+
+    # Middle (highs)
+    for i, h in enumerate(highs):
+        freqs_m, psd_norm, f_peak = compute_norm_psd(h['cilia_values'], dt)
+        color = cmap_gray(normed[i])
+        ax_c.plot(freqs_m, psd_norm, color=color, lw=2, label=f'High {i+1}: {f_peak:.2f} Hz, Δ={h["mean_distance"]:.1f}µm')
+
+    # After (low2)
+    if len(lows) == 2:
+        freqs_m, psd_norm, f_peak = compute_norm_psd(lows[-1]['cilia_values'], dt)
+        ax_c.plot(freqs_m, psd_norm, color='green', lw=2, ls='--', label=f'After: {f_peak:.2f} Hz')
 
     ax_c.set_title('Cilia PSD (normalized)')
     ax_c.set_ylabel('Normalized Power')
-    ax_c.legend()
+    ax_c.legend(fontsize=8)
 
-    # ACTUATOR
-    for seg_name, actuator, color in zip(segments, actuator_segments, colors):
-        if actuator is None:
-            continue
-        a = actuator - np.mean(actuator)
-        n = len(a)
-        freqs = fftfreq(n, d=dt)[:n//2]
-        psd = np.abs(fft(a))[:n//2]**2
-        f_peak = freqs[np.argmax(psd)]
-        fmin, fmax = 0.3 * f_peak, 3.5 * f_peak
-        mask = (freqs >= fmin) & (freqs <= fmax)
-        freqs_m = freqs[mask]
-        psd_m = psd[mask]
-        area = np.trapz(psd_m, freqs_m)
-        psd_norm = psd_m / area
-        ax_a.plot(freqs_m, psd_norm, color=color, label=f'{seg_name}: {f_peak:.2f} Hz')
+    # --- Actuator PSDs (all high segments) ---
+    for i, h in enumerate(highs):
+        freqs_m, psd_norm, f_peak = compute_norm_psd(h['actuator_values'], dt)
+        ax_a.plot(freqs_m, psd_norm, color='red', lw=1.5, alpha=0.8,
+                  label=f'Actuator {i+1}: {f_peak:.2f} Hz')
 
-    ax_a.set_title('Actuator PSD (normalized)')
+    ax_a.set_title('Actuator PSDs (normalized)')
     ax_a.set_xlabel('Frequency (Hz)')
     ax_a.set_ylabel('Normalized Power')
-    ax_a.legend()
+    ax_a.legend(fontsize=8)
 
     plt.tight_layout()
     plt.show()
 
-def estimate_baseline_omega(phi_pre, t_pre, phi_post, t_post):
+def split_distancebased_segments(
+    segments,
+    envelope_timescale=0.5,
+    poly_order=3,
+    distance_cutoff=3.5,
+    max_segments=5,
+    debug=True
+):
     """
-    Estimate the cilium's intrinsic angular velocity ω_c
-    by averaging the slopes in the 'before' and 'after' segments.
-    """
-    ω_pre  = (phi_pre[-1]  - phi_pre[0])  / (t_pre[-1]  - t_pre[0])
-    ω_post = (phi_post[-1] - phi_post[0]) / (t_post[-1] - t_post[0])
-    ω_c = 0.5 * (ω_pre + ω_post)
-    return ω_c
-
-def fit_interaction_model(phi_c, t_c, phi_b, t_b, ω_c, order=1):
-    """
-    Fit    dotφ_c(t) = ω_c + F(φ_c, φ_b) + η
-    
-    where F(φ_c,φ_b) = Σ_{k=1..order} [ a_k sin(kφ_c)+ b_k cos(kφ_c)
-                                       + c_k sin(kφ_b)+ d_k cos(kφ_b) ].
-    
-    This version first interpolates φ_b onto the φ_c time‐base t_c.
-    
-    Parameters
-    ----------
-    phi_c : array_like
-        Cilium phase, length N
-    t_c : array_like
-        Time‐base for phi_c, length N
-    phi_b : array_like
-        Beam/actuator phase, length M
-    t_b : array_like
-        Time‐base for phi_b, length M
-    ω_c : float
-        Intrinsic cilium angular velocity
-    order : int
-        Highest harmonic order to include in F.
-    
-    Returns
-    -------
-    ω_c : float
-    β    : ndarray, shape (4*order,)
-    D    : float
-    """
-    import numpy as np
-    from scipy.interpolate import interp1d
-    import matplotlib.pyplot as plt
-
-    # 1) interpolate φ_b onto t_c
-    interp_b = interp1d(t_b, phi_b, kind='linear',
-                        bounds_error=False, fill_value='extrapolate')
-    φb_on_c = interp_b(t_c)
-
-    # 2) compute φ̇_c and residual y = φ̇_c - ω_c
-    dt = np.median(np.diff(t_c))
-    φdot = np.gradient(phi_c, dt)
-    y = φdot - ω_c
-
-    # 3) build design matrix
-    cols = []
-    for k in range(1, order+1):
-        cols.append(np.sin(k*phi_c))
-        cols.append(np.cos(k*phi_c))
-        cols.append(np.sin(k*φb_on_c))
-        cols.append(np.cos(k*φb_on_c))
-    X = np.column_stack(cols)
-
-    # 4) least‐squares for β
-    β, *_ = np.linalg.lstsq(X, y, rcond=None)
-
-    # 5) noise level D
-    resid = y - X.dot(β)
-    D = np.var(resid)/2
-
-    # 6) report
-    print(f"ω_c = {ω_c:.4f},   D = {D:.2e}")
-    names = []
-    for k in range(1,order+1):
-        names += [f"a{k}", f"b{k}", f"c{k}", f"d{k}"]
-    for nm, val in zip(names, β):
-        print(f"{nm} = {val:.2e}")
-
-    # 7) plot F on a (φ_c, φ_b) grid
-    φc_grid = np.linspace(0,2*np.pi,200)
-    φb_grid = np.linspace(0,2*np.pi,200)
-    Φc, Φb = np.meshgrid(φc_grid, φb_grid, indexing='ij')
-    F = np.zeros_like(Φc)
-    idx = 0
-    for k in range(1, order+1):
-        F += β[idx]   * np.sin( k*Φc); idx+=1
-        F += β[idx]   * np.cos( k*Φc); idx+=1
-        F += β[idx]   * np.sin( k*Φb); idx+=1
-        F += β[idx]   * np.cos( k*Φb); idx+=1
-
-    plt.figure(figsize=(6,5))
-    im = plt.pcolormesh(φb_grid, φc_grid, F,
-                        shading='auto', cmap='viridis')
-    plt.xlabel("φ_beam")
-    plt.ylabel("φ_cilium")
-    plt.title("F(φ_c, φ_b)")
-    plt.colorbar(im, label="F")
-    plt.tight_layout()
-    plt.show()
-
-    return ω_c, β, D
-
-def fit_interaction_model_diff(phi_c, t_c, phi_b, t_b, ω_c, order=1):
-    """
-    Fit   φ̇_c(t) = ω_c + F(φ_b, Δφ) + η,
-    with Δφ = φ_c − φ_b, and
-      F(φ_b, Δφ) = Σ_{k=1..order} [
-         a_k sin(k·Δφ) + b_k cos(k·Δφ)
-       + c_k sin(k·φ_b) + d_k cos(k·φ_b)
-      ].
+    Split the middle segment into subsegments based on drift of the distance
+    between cilia and actuator lower envelopes.
 
     Parameters
     ----------
-    phi_c : array_like, length N
-        Cilium phase.
-    t_c : array_like, length N
-        Time‐base for phi_c.
-    phi_b : array_like, length M
-        Actuator phase.
-    t_b : array_like, length M
-        Time‐base for phi_b.
-    ω_c : float
-        Baseline cilium angular velocity.
-    order : int
-        Max harmonic (default=1).
+    segments : list
+        Output of detect_actuator_activity_segments().
+    envelope_timescale : float
+        Characteristic smoothing time (seconds) for envelope extraction.
+    poly_order : int
+        Polynomial order for Savitzky–Golay smoothing.
+    distance_cutoff : float
+        Maximum allowed variation (µm) in cilia–actuator distance per subsegment.
+    max_segments : int
+        Maximum number of subsegments to create.
+    debug : bool
+        If True, print diagnostic info and show plots.
 
     Returns
     -------
-    ω_c : float
-    β    : ndarray, shape (4*order,)
-    D    : float
+    subsegments : list of dict
+        Each dict has keys: 'start_time', 'end_time', 'mean_distance'.
     """
-    import numpy as np
-    from scipy.interpolate import interp1d
-    import matplotlib.pyplot as plt
+    cilia_values = np.asarray(segments[1]['cilia_values'])
+    cilia_times = np.asarray(segments[1]['cilia_times'])
+    actuator_values = np.asarray(segments[1]['actuator_values'])
 
-    # 1) interpolate φ_b onto t_c
-    interp_b = interp1d(t_b, phi_b, kind='linear',
-                        bounds_error=False, fill_value='extrapolate')
-    φb_on_c = interp_b(t_c)
+    dt = np.median(np.diff(cilia_times))
+    window_len = int(np.clip(envelope_timescale / dt, 5, len(cilia_times)//3))
+    if window_len % 2 == 0:
+        window_len += 1  # must be odd for savgol_filter
 
-    # 2) compute φ̇_c and residual y = φ̇_c − ω_c
-    dt = np.median(np.diff(t_c))
-    φdot = np.gradient(phi_c, dt)
-    y = φdot - ω_c
+    def compute_lower_envelope(t, v, label):
+        min_idx = argrelextrema(v, np.less, order=5)[0]
+        if len(min_idx) < 3:
+            print(f"⚠️ Not enough minima for {label}.")
+            return np.full_like(v, np.nan)
+        t_min = t[min_idx]
+        v_min = v[min_idx]
+        f_env = interp1d(t_min, v_min, kind='linear', bounds_error=False, fill_value='extrapolate')
+        env_raw = f_env(t)
+        env_smooth = savgol_filter(env_raw, window_length=window_len, polyorder=poly_order)
+        return env_smooth
 
-    # 3) build design matrix using Δφ = φ_c − φ_b
-    Δφ = phi_c - φb_on_c
-    cols = []
-    for k in range(1, order+1):
-        cols += [
-            np.sin(k*Δφ), np.cos(k*Δφ),
-            np.sin(k*φb_on_c), np.cos(k*φb_on_c)
-        ]
-    X = np.column_stack(cols)
+    env_cilia = compute_lower_envelope(cilia_times, cilia_values, "Cilia")
+    env_act = compute_lower_envelope(cilia_times, actuator_values, "Actuator")
 
-    # 4) least‐squares for β
-    β, *_ = np.linalg.lstsq(X, y, rcond=None)
+    distance = env_cilia - env_act
 
-    # 5) noise level D
-    resid = y - X.dot(β)
-    D = np.var(resid)/2
+    # --- Determine segment boundaries based on distance variation ---
+    n_segments = 1
+    cut_indices = []
+    while n_segments <= max_segments:
+        split_idx = np.linspace(0, len(distance) - 1, n_segments + 1, dtype=int)
+        ok = True
+        for i in range(n_segments):
+            seg = distance[split_idx[i]:split_idx[i+1]]
+            if np.nanmax(seg) - np.nanmin(seg) > distance_cutoff:
+                ok = False
+                break
+        if ok:
+            break
+        n_segments += 1
 
-    # 6) report
-    print(f"ω_c = {ω_c:.4f},   D = {D:.2e}")
-    names = []
-    for k in range(1, order+1):
-        names += [f"a{k}"  , f"b{k}",   # for Δφ
-                  f"c{k}"  , f"d{k}"]   # for φ_b
-    for nm, val in zip(names, β):
-        print(f"{nm} = {val:.2e}")
+    # Final indices
+    split_idx = np.linspace(0, len(distance) - 1, n_segments + 1, dtype=int)
 
-    # 7) visualize F on a grid of (φ_b, Δφ)
-    diff_grid = np.linspace(0, 2*np.pi, 200)
-    φb_grid = np.linspace(0, 2*np.pi, 200)
-    ΔG, BG = np.meshgrid(diff_grid, φb_grid, indexing='ij')
-    F = np.zeros_like(ΔG)
-    idx = 0
-    for k in range(1, order+1):
-        F += β[idx]   * np.sin(k*ΔG);   idx += 1
-        F += β[idx]   * np.cos(k*ΔG);   idx += 1
-        F += β[idx]   * np.sin(k*BG);   idx += 1
-        F += β[idx]   * np.cos(k*BG);   idx += 1
+    # --- Compute mean distance per subsegment ---
+    subsegments = []
+    for i in range(n_segments):
+        start_i, end_i = split_idx[i], split_idx[i+1]
+        seg_dist = distance[start_i:end_i]
+        mean_dist = np.nanmean(seg_dist)
+        subsegments.append({
+            'type': 'high',  # subsegments come from high-activity region
+            'start_time': cilia_times[start_i],
+            'end_time': cilia_times[end_i-1],
+            'cilia_times': cilia_times[start_i:end_i],
+            'cilia_values': cilia_values[start_i:end_i],
+            'actuator_values': actuator_values[start_i:end_i],
+            'mean_distance': mean_dist,
+        })
 
-    plt.figure(figsize=(6,5))
-    pcm = plt.pcolormesh(φb_grid, diff_grid, F,
-                         shading='auto', cmap='viridis')
-    plt.xlabel("φ_beam")
-    plt.ylabel("Δφ = φ_c − φ_b")
-    plt.title("Restricted F(φ_b, Δφ)")
-    plt.colorbar(pcm, label="F")
-    plt.tight_layout()
-    plt.show()
+    if debug:
+        print(f"\nSplit into {n_segments} subsegments (cutoff = {distance_cutoff} µm):")
+        for i, s in enumerate(subsegments):
+            print(f"  Segment {i+1}: {s['start_time']:.2f}–{s['end_time']:.2f}s, "
+                  f"mean Δ = {s['mean_distance']:.3f} µm")
+        # --- Plot as before ---
+        fig, ax1 = plt.subplots(figsize=(10, 5))
+        ax1.plot(cilia_times, cilia_values, color='purple', alpha=0.6, label='Cilia')
+        ax1.plot(cilia_times, actuator_values, color='orange', alpha=0.6, label='Actuator')
+        ax1.plot(cilia_times, env_cilia, color='purple', lw=2, label='Cilia Lower Envelope')
+        ax1.plot(cilia_times, env_act, color='orange', lw=2, label='Actuator Lower Envelope')
+        for s in subsegments[:-1]:
+            ax1.axvline(s['end_time'], color='black', ls='--', lw=1)
+        ax2 = ax1.twinx()
+        ax2.plot(cilia_times, distance, color='gray', lw=1, label='Envelope Distance (Cilia−Actuator)')
+        ax2.set_ylabel("Envelope Distance (µm)", color='gray')
+        ax1.set_xlabel("Time (s)")
+        ax1.set_ylabel("Amplitude (µm)")
+        ax1.set_title("Segment splitting based on envelope distance drift")
+        ax1.legend(loc='upper left')
+        plt.tight_layout()
+        plt.show()
 
-    return ω_c, β, D
+    # --- Reassemble full segment list (low1 + subsegments + low2) ---
+    new_segments = []
+    if len(segments) >= 1 and segments[0]['type'] == 'low':
+        new_segments.append(segments[0])
+    new_segments.extend(subsegments)
+    if len(segments) >= 3 and segments[-1]['type'] == 'low':
+        new_segments.append(segments[-1])
 
-def fit_interaction_model_diff2(phi_c, t_c, phi_b, t_b, ω_c):
-    """
-    Fit φ̇_c(t) = ω_c + F(Δφ) + η
-    where Δφ = φ_c − φ_b and
-      F(Δφ) = a1 sin(Δφ) + b1 cos(Δφ)
-            + a2 sin(2Δφ) + b2 cos(2Δφ).
-    """
-    import numpy as np
-    from scipy.interpolate import interp1d
-    import matplotlib.pyplot as plt
-
-    # 1) interpolate φ_b → φb_on_c
-    interp_b = interp1d(t_b, phi_b, kind='linear',
-                        bounds_error=False, fill_value='extrapolate')
-    φb_on_c = interp_b(t_c)
-
-    # 2) compute φ̇_c and residual y = φ̇_c − ω_c
-    dt = np.median(np.diff(t_c))
-    φdot = np.gradient(phi_c, dt)
-    y = φdot - ω_c
-
-    # 3) build design matrix with Δφ terms up to order 2
-    Δφ = (phi_c - φb_on_c) % (2*np.pi)
-    X = np.column_stack([
-        np.sin(Δφ), np.cos(Δφ),
-        np.sin(2*Δφ), np.cos(2*Δφ)
-    ])
-
-    # 4) solve least‐squares
-    β, *_ = np.linalg.lstsq(X, y, rcond=None)
-
-    # 5) noise level D
-    resid = y - X.dot(β)
-    D = np.var(resid)/2
-
-    # 6) report
-    print(f"ω_c = {ω_c:.4f},   D = {D:.2e}")
-    for name, val in zip(['a1','b1','a2','b2'], β):
-        print(f"{name} = {val:.2e}")
-
-    # 7) plot F(Δφ)
-    grid = np.linspace(0, 2*np.pi, 300)
-    F_grid = (β[0]*np.sin(grid) + β[1]*np.cos(grid)
-            + β[2]*np.sin(2*grid) + β[3]*np.cos(2*grid))
-
-    plt.figure(figsize=(6,4))
-    plt.plot(grid, F_grid, '-', lw=2)
-    plt.xlabel(r'$\Delta\phi = \phi_c - \phi_b$')
-    plt.ylabel('F(Δφ)')
-    plt.title('Interaction function up to 2nd harmonic')
-    plt.axhline(0, color='k', lw=0.5)
-    plt.tight_layout()
-    plt.show()
-
-    return ω_c, β, D
-
+    return new_segments
 
 def analyze(
     df,
@@ -1020,12 +842,19 @@ def analyze(
 ):
     segments = detect_actuator_activity_segments(df, window_size=std_window_size)
     print(f"{filename}: detected {len(segments)} segments")
+    if len(segments)!=3:
+        raise
+    
+    #split intermediate segments according to distance
+    segments = split_distancebased_segments(segments)
+    
 
     # Lists of processed data dicts
     cilia_procs   = []
     actuator_procs = []
-
     for i, seg in enumerate(segments):
+        print(i,seg)
+        
         print(f"Segment {i+1}/{len(segments)}: {seg['type']} activity, "
               f"t = {seg['start_time']:.2f}–{seg['end_time']:.2f}s")
 
@@ -1047,49 +876,31 @@ def analyze(
         cilia_procs.append(c_data)
         actuator_procs.append(b_data)
 
-    # PSD block (unchanged)
-    if show_PSD and len(cilia_procs) == 3:
+    # PSD block 
+    if show_PSD:
         dt = np.median(np.diff(df[TIME_COL]))
-        plot_psd_histogram_by_segment(
-            [p['v'] for p in cilia_procs],
-            [p['denoised'] if p is not None else None for p in actuator_procs],
-            dt
-        )
+        plot_psd_histogram_by_segment(segments, dt)
 
-    # --- now estimate ω_c from the two low‐activity segments ---
-    φ_pre, t_pre  = cilia_procs[0]['phase'], cilia_procs[0]['time']
-    φ_post, t_post = cilia_procs[2]['phase'], cilia_procs[2]['time']
-    ω_c = estimate_baseline_omega(φ_pre, t_pre, φ_post, t_post)
 
-    # --- middle (high activity) for fit ---
-    φc_mid = cilia_procs[1]['phase']
-    tc_mid  = cilia_procs[1]['time']
-    φb_mid  = actuator_procs[1]['phase']
-    tb_mid  = actuator_procs[1]['time'][HILBERT_REMOVE:-HILBERT_REMOVE]
-
-    # fit the interaction model
-    #fit_interaction_model(φc_mid, tc_mid, φb_mid, tb_mid, ω_c, order=1)
-    fit_interaction_model_diff(φc_mid, tc_mid, φb_mid, tb_mid, ω_c, order=1)
-    ω_c, β, D = fit_interaction_model_diff2(
-        φc_mid, tc_mid, φb_mid, tb_mid,
-        ω_c
-    )
-
+  
 def full_analysis(filepath_pattern, show_seg_plots=True, show_PSD=True):
     filepaths = glob.glob(filepath_pattern)
+    all_res=[]
     for fpath in filepaths:
         df = pd.read_csv(fpath)
         filename = Path(fpath).name
 
-        analyze(
+        res=analyze(
             df,
             filename,
             show_seg_plots=show_seg_plots,
             show_PSD=show_PSD,
             std_window_size=WINDOW_LENGTH,
         )
-        
+        all_res.append(res)
+    
+    #convert to csv or df or np object
 
 if __name__ == "__main__":
     # full_analysis("/home/max/Documents/02_Data/Cilia_project/farzin/csv_to_analyze/*.csv", show_seg_plots=True, show_PSD=True)
-    full_analysis("/home/max/Downloads/download/*.csv", show_seg_plots=True, show_PSD=True)
+    full_analysis("/home/max/Downloads/download/*.csv", show_seg_plots=False, show_PSD=True)
