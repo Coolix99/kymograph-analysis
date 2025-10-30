@@ -10,6 +10,9 @@ from scipy.stats import gaussian_kde
 from scipy.interpolate import interp1d
 from matplotlib.widgets import Slider
 from scipy.signal import argrelextrema, savgol_filter
+from scipy.optimize import curve_fit
+from scipy.stats import circmean, circstd
+
 
 WINDOW_LENGTH = 30
 CILIA_COL='Cilia_EndPoint_Y_um'
@@ -18,7 +21,7 @@ TIME_COL='Time_s'
 HILBERT_REMOVE=30
 
 
-def detect_actuator_activity_segments(df, window_size: int = 5):
+def detect_actuator_activity_segments(df, window_size: int = 5, show=True):
     """
     Detect continuous low- and high-activity segments in actuator movement,
     then pick the largest high-activity segment and the surrounding low-activity
@@ -112,7 +115,8 @@ def detect_actuator_activity_segments(df, window_size: int = 5):
     start_low2 = low2['start_time']  if low2 else t_end
 
     # 6) interactive plot
-    fig, ax = plt.subplots(figsize=(12,6))
+    if show:
+        fig, ax = plt.subplots(figsize=(12,6))
     t_plot = times[:len(stds)]
 
     def redraw(end_low1, start_high, end_high, start_low2):
@@ -132,7 +136,8 @@ def detect_actuator_activity_segments(df, window_size: int = 5):
         ax.set_title('Adjust activity boundaries')
         ax.legend(loc='upper right')
 
-    redraw(end_low1, start_high, end_high, start_low2)
+    if show:
+        redraw(end_low1, start_high, end_high, start_low2)
 
     axcol = 'lightgoldenrodyellow'
     s_low2 = Slider(plt.axes([0.15, 0.02, 0.7, 0.02], facecolor=axcol),
@@ -162,10 +167,10 @@ def detect_actuator_activity_segments(df, window_size: int = 5):
 
     for s in (s_low1, s_sh, s_eh, s_low2):
         s.on_changed(update)
-
-    plt.tight_layout()
-    plt.subplots_adjust(bottom=0.267)
-    plt.show()
+    if show:
+        plt.tight_layout()
+        plt.subplots_adjust(bottom=0.267)
+        plt.show()
 
     # 7) build final segments
     out = []
@@ -489,9 +494,9 @@ def process_signal_actuator(t,v):
     phase=compute_phase_from_protophi(phase)
 
     return {
-        'time':t,
+        'time': t[HILBERT_REMOVE:-HILBERT_REMOVE],
         'phase': phase,
-        'denoised': denoised,
+        'denoised': denoised[HILBERT_REMOVE:-HILBERT_REMOVE],
     }
 
 def plot_analysis(c_data, b_data):
@@ -623,12 +628,111 @@ def plot_analysis(c_data, b_data):
         plt.tight_layout()
         plt.show()
 
-def plot_psd_histogram_by_segment(segments, dt):
+def fit_psd_peak(freqs, psd, model='lorentz', smooth_win=7, poly_order=2, debug=False):
     """
-    Plot normalized PSD curves for cilia and actuator across multiple segments.
-    Low-activity (before/after) segments are shown in green,
-    high-activity subsegments are shown in gray (brightness ∝ mean distance).
-    Actuator PSDs are shown in red (overlaid).
+    Fit a single dominant peak in the PSD robustly with a Lorentzian or Gaussian.
+
+    Parameters
+    ----------
+    freqs : array
+        Frequency array (Hz)
+    psd : array
+        Power spectral density values (normalized or raw)
+    model : {'lorentz', 'gauss'}
+        Peak shape model to fit.
+    smooth_win : int
+        Savitzky–Golay smoothing window (odd number).
+    poly_order : int
+        Polynomial order for Savitzky–Golay.
+    debug : bool
+        If True, plot PSD and fitted curve.
+
+    Returns
+    -------
+    fit_params : dict
+        {'f0': center, 'height': peak height, 'width': FWHM, 'model': model}
+    psd_fit : np.ndarray
+        Fitted PSD values for plotting.
+    """
+    freqs = np.asarray(freqs)
+    psd = np.asarray(psd)
+    if smooth_win >= len(psd):
+        smooth_win = max(5, len(psd)//3 | 1)
+    psd_smooth = savgol_filter(psd, smooth_win, poly_order)
+
+    # initial guesses
+    f0_guess = freqs[np.argmax(psd_smooth)]
+    height_guess = np.max(psd_smooth)
+    half_max = height_guess / 2
+    # crude width estimate
+    above_half = np.where(psd_smooth > half_max)[0]
+    if len(above_half) < 2:
+        width_guess = (freqs[-1] - freqs[0]) / 10
+    else:
+        width_guess = freqs[above_half[-1]] - freqs[above_half[0]]
+
+    # model definitions
+    if model == 'lorentz':
+        def peak_func(f, f0, A, gamma, offset):
+            return A / (1 + ((f - f0) / (gamma / 2))**2) + offset
+    else:  # Gaussian
+        def peak_func(f, f0, A, sigma, offset):
+            return A * np.exp(-0.5 * ((f - f0)/sigma)**2) + offset
+
+    # restrict to neighborhood ±1.5×width_guess
+    mask = (freqs >= f0_guess - 1.5*width_guess) & (freqs <= f0_guess + 1.5*width_guess)
+    f_fit = freqs[mask]
+    p_fit = psd[mask]
+    if len(f_fit) < 5:
+        raise
+        f_fit, p_fit = freqs, psd
+
+    # fit
+    try:
+        p0 = [f0_guess, height_guess, width_guess, np.min(p_fit)]
+        psd_fit = peak_func(freqs, *p0)
+        
+        popt, _ = curve_fit(peak_func, f_fit, p_fit, p0=p0, maxfev=5000, method='trf', ftol=1e-5, xtol=1e-5)
+    except Exception:
+        return {'f0': f0_guess, 'height': height_guess, 'width': width_guess,
+                'f0_guess': f0_guess, 'height_guess': height_guess, 'width_guess': width_guess, 'model': 'failed'}, psd
+
+    # evaluate fitted curve
+    psd_fit = peak_func(freqs, *popt)
+
+    # Extract FWHM
+    if model == 'lorentz':
+        fwhm = popt[2]
+    else:
+        fwhm = 2.355 * popt[2]  # FWHM of Gaussian
+
+    fit_params = {
+        'f0_guess': f0_guess,
+        'height_guess': height_guess,
+        'width_guess': width_guess,
+        'f0': popt[0],
+        'height': popt[1],
+        'width': fwhm,
+        'model': model
+    }
+
+    if debug:
+        plt.figure(figsize=(6,3))
+        plt.plot(freqs, psd, 'gray', alpha=0.5, label='Raw PSD')
+        plt.plot(freqs, psd_smooth, 'k', lw=1.5, label='Smoothed')
+        plt.plot(freqs, psd_fit, 'r--', lw=1.5, label=f'Fit ({model})')
+        plt.axvline(fit_params['f0'], color='b', ls='--', label=f"f0={fit_params['f0']:.2f} Hz")
+        plt.title(f"Peak Fit: f0={fit_params['f0']:.2f} Hz, width={fit_params['width']:.2f} Hz")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    return fit_params, psd_fit
+
+def analyze_psd_by_segment(segments, dt, plot=True):
+    """
+    Compute normalized PSDs for cilia and actuator across multiple segments,
+    fit peaks, and optionally plot the results.
 
     Parameters
     ----------
@@ -637,10 +741,27 @@ def plot_psd_histogram_by_segment(segments, dt):
         Each high segment must have 'actuator_values' and 'mean_distance'.
     dt : float
         Sampling interval (s).
+    plot : bool
+        If True, plot PSDs and fitted peaks.
+
+    Returns
+    -------
+    results : list of dict
+        Each entry contains:
+        {
+          'segment_index': int,
+          'type': 'low' | 'high',
+          'target': 'cilia' | 'actuator',
+          'f0': center frequency (Hz),
+          'width': FWHM (Hz),
+          'height': amplitude (normalized power),
+          'mean_distance': float or np.nan
+        }
     """
     from scipy.fft import fft, fftfreq
-    import matplotlib.pyplot as plt
     import matplotlib.cm as cm
+
+    results = []
 
     # Separate low/high segments
     lows = [s for s in segments if s['type'] == 'low']
@@ -661,60 +782,74 @@ def plot_psd_histogram_by_segment(segments, dt):
         psd_norm = psd_m / area if area > 0 else psd_m
         return freqs_m, psd_norm, f_peak
 
-    # --- Create figure ---
-    fig, (ax_c, ax_a) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    if plot:
+        fig, (ax_c, ax_a) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
 
-    # --- Cilia PSDs ---
     cmap_gray = cm.get_cmap('Greys')
     if highs:
         dist_vals = np.array([h['mean_distance'] for h in highs])
-        # Normalize distances to [0.3, 0.9] gray levels
         if np.ptp(dist_vals) == 0:
             normed = np.full_like(dist_vals, 0.6)
         else:
             normed = 0.3 + 0.6 * (dist_vals - dist_vals.min()) / (dist_vals.max() - dist_vals.min())
 
-    # Before (low1)
+    # --- Helper for plotting + collecting results ---
+    def process_segment(i, label, signal, seg_type, color, mean_distance=np.nan, target='cilia', linestyle='-'):
+        freqs_m, psd_norm, f_peak = compute_norm_psd(signal, dt)
+        fit_params, psd_fit = fit_psd_peak(freqs_m, psd_norm, model='lorentz', debug=False)
+        results.append({
+            'segment_index': i,
+            'type': seg_type,
+            'target': target,
+            'f0': fit_params['f0'],
+            'width': fit_params['width'],
+            'height': fit_params['height'],
+            'model': fit_params['model'],
+            'mean_distance': mean_distance,
+        })
+
+        if plot:
+            ax = ax_c if target == 'cilia' else ax_a
+            ax.plot(freqs_m, psd_norm, color=color, lw=2, ls=linestyle, label=f'{label}')
+            ax.plot(freqs_m, psd_fit, color=color, ls=':', lw=1.5)
+            ax.text(fit_params['f0'], fit_params['height'], f"{fit_params['f0']:.2f} Hz\n±{fit_params['width']:.2f} Hz",
+                    fontsize=7, color=color)
+
+    # --- Cilia segments ---
     if len(lows) >= 1:
-        freqs_m, psd_norm, f_peak = compute_norm_psd(lows[0]['cilia_values'], dt)
-        ax_c.plot(freqs_m, psd_norm, color='green', lw=2, label=f'Before: {f_peak:.2f} Hz')
-
-    # Middle (highs)
+        process_segment(0, "Before (cilia)", lows[0]['cilia_values'], 'low', 'green', target='cilia')
     for i, h in enumerate(highs):
-        freqs_m, psd_norm, f_peak = compute_norm_psd(h['cilia_values'], dt)
         color = cmap_gray(normed[i])
-        ax_c.plot(freqs_m, psd_norm, color=color, lw=2, label=f'High {i+1}: {f_peak:.2f} Hz, Δ={h["mean_distance"]:.1f}µm')
-
-    # After (low2)
+        process_segment(i + 1, f"High {i+1} (cilia)", h['cilia_values'], 'high', color, mean_distance=h['mean_distance'], target='cilia')
     if len(lows) == 2:
-        freqs_m, psd_norm, f_peak = compute_norm_psd(lows[-1]['cilia_values'], dt)
-        ax_c.plot(freqs_m, psd_norm, color='green', lw=2, ls='--', label=f'After: {f_peak:.2f} Hz')
+        process_segment(len(highs) + 1, "After (cilia)", lows[-1]['cilia_values'], 'low', 'green', target='cilia', linestyle='--')
 
-    ax_c.set_title('Cilia PSD (normalized)')
-    ax_c.set_ylabel('Normalized Power')
-    ax_c.legend(fontsize=8)
-
-    # --- Actuator PSDs (all high segments) ---
+    # --- Actuator segments ---
     for i, h in enumerate(highs):
-        freqs_m, psd_norm, f_peak = compute_norm_psd(h['actuator_values'], dt)
-        ax_a.plot(freqs_m, psd_norm, color='red', lw=1.5, alpha=0.8,
-                  label=f'Actuator {i+1}: {f_peak:.2f} Hz')
+        process_segment(i + 1, f"High {i+1} (actuator)", h['actuator_values'], 'high', 'red', mean_distance=h['mean_distance'], target='actuator')
 
-    ax_a.set_title('Actuator PSDs (normalized)')
-    ax_a.set_xlabel('Frequency (Hz)')
-    ax_a.set_ylabel('Normalized Power')
-    ax_a.legend(fontsize=8)
+    if plot:
+        ax_c.set_title('Cilia PSD (normalized)')
+        ax_c.set_ylabel('Normalized Power')
+        ax_c.legend(fontsize=8)
 
-    plt.tight_layout()
-    plt.show()
+        ax_a.set_title('Actuator PSDs (normalized)')
+        ax_a.set_xlabel('Frequency (Hz)')
+        ax_a.set_ylabel('Normalized Power')
+        ax_a.legend(fontsize=8)
+
+        plt.tight_layout()
+        plt.show()
+
+    return results
 
 def split_distancebased_segments(
     segments,
     envelope_timescale=0.5,
     poly_order=3,
     distance_cutoff=3.5,
-    max_segments=5,
-    debug=True
+    max_segments=4,
+    debug=False
 ):
     """
     Split the middle segment into subsegments based on drift of the distance
@@ -840,7 +975,7 @@ def analyze(
     show_PSD=True,
     std_window_size=5,
 ):
-    segments = detect_actuator_activity_segments(df, window_size=std_window_size)
+    segments = detect_actuator_activity_segments(df, window_size=std_window_size, show=False)
     print(f"{filename}: detected {len(segments)} segments")
     if len(segments)!=3:
         raise
@@ -852,9 +987,7 @@ def analyze(
     # Lists of processed data dicts
     cilia_procs   = []
     actuator_procs = []
-    for i, seg in enumerate(segments):
-        print(i,seg)
-        
+    for i, seg in enumerate(segments):      
         print(f"Segment {i+1}/{len(segments)}: {seg['type']} activity, "
               f"t = {seg['start_time']:.2f}–{seg['end_time']:.2f}s")
 
@@ -877,16 +1010,224 @@ def analyze(
         actuator_procs.append(b_data)
 
     # PSD block 
-    if show_PSD:
-        dt = np.median(np.diff(df[TIME_COL]))
-        plot_psd_histogram_by_segment(segments, dt)
+    
+    dt = np.median(np.diff(df[TIME_COL]))
+    psd_results = analyze_psd_by_segment(segments, dt, plot=show_PSD)
+
+    
+    return cilia_procs, actuator_procs, psd_results
+
+def summarize_psd_results(all_res):
+    """
+    Process all_res (from full_analysis) to extract PSD summary statistics.
+
+    For each file:
+      • Take segment 0 and -1 ('before' and 'after') → cilia frequency baseline.
+      • Take all 'high' segments → cilia + actuator PSD fit results.
+      • Compute weighted averages and frequency dispersion.
+
+    Returns
+    -------
+    summary_df : pd.DataFrame
+        Columns:
+        ['filename', 'mean_distance', 'cilia_f0', 'cilia_fwidth', 
+         'cilia_f0_baseline', 'cilia_fwidth_total',
+         'actuator_f0_mean', 'actuator_f0_sem']
+    """
+    records = []
+
+    for filename, (cilia_procs, actuator_procs, psd_results) in all_res.items():
+        df_psd = pd.DataFrame(psd_results)
+        df_psd = df_psd[df_psd['model'] != 'failed'].copy()
+        # --- Identify segment categories ---
+        lows = df_psd[(df_psd['type'] == 'low') & (df_psd['target'] == 'cilia')]
+        highs_cilia = df_psd[(df_psd['type'] == 'high') & (df_psd['target'] == 'cilia')]
+        highs_act = df_psd[(df_psd['type'] == 'high') & (df_psd['target'] == 'actuator')]
+
+        # --- Compute baseline frequency (before+after) ---
+        if len(lows) >= 1:
+            # Weighted mean by width
+            weights = 1 / np.clip(lows['width'], 1e-6, None)
+            f0_baseline = np.average(lows['f0'], weights=weights)
+            # "total width" = min->max freq across low segments + avg width
+            fmin, fmax = lows['f0'].min(), lows['f0'].max()
+            fwidth_total = (fmax - fmin) + np.mean(lows['width'])
+        else:
+            f0_baseline = np.nan
+            fwidth_total = np.nan
+            
+        #actuator with same segment index
+        if len(highs_act) > 0:
+            actuator_f0_mean = highs_act['f0'].mean()
+            actuator_f0_sem = highs_act['f0'].sem()
+        else:
+            actuator_f0_mean = np.nan
+            actuator_f0_sem = np.nan
+
+        # --- For each high segment (cilia+actuator) ---
+        for i, seg in enumerate(highs_cilia.itertuples()):
+            mean_distance = seg.mean_distance
+            cilia_f0 = seg.f0
+            cilia_fwidth = seg.width
+
+            records.append({
+                'filename': filename,
+                'mean_distance': mean_distance,
+                'cilia_f': cilia_f0,
+                'cilia_fwidth': cilia_fwidth,
+                'cilia_f0': f0_baseline,
+                'cilia_f0width': fwidth_total,
+                'actuator_f0_mean': actuator_f0_mean,
+                'actuator_f0_sem': actuator_f0_sem,
+            })
+
+    summary_df = pd.DataFrame(records)
+
+    # Optional: sort by filename and mean_distance
+    summary_df = summary_df.sort_values(['filename', 'mean_distance']).reset_index(drop=True)
+    return summary_df
+
+def postprocess_summary(psd_csv, phase_csv, cmap_general='jet', cmap_cyclic='twilight'):
+    """
+    Merge PSD and phase summaries, and plot all frequency/phase relationships.
+
+    Parameters
+    ----------
+    psd_csv : str
+        Path to PSD summary CSV (from summarize_psd_results).
+    phase_csv : str
+        Path to phase summary CSV (from summarize_phase_relationships).
+    cmap_general : str
+        Colormap for non-cyclic data (e.g. 'jet', 'viridis', 'plasma', etc.)
+    cmap_cyclic : str
+        Cyclic colormap for phase_mean (e.g. 'twilight', 'hsv', 'twilight_shifted').
+    """
 
 
-  
+    # --- Load data ---
+    df_psd = pd.read_csv(psd_csv)
+    df_phase = pd.read_csv(phase_csv)
+
+    # Round distance for safe join
+    df_psd['mean_distance_round'] = df_psd['mean_distance'].round(6)
+    df_phase['mean_distance_round'] = df_phase['mean_distance'].round(6)
+
+    # --- Merge ---
+    df = pd.merge(df_psd, df_phase,
+                  on=['filename', 'mean_distance_round'],
+                  how='inner',
+                  suffixes=('', '_phase'))
+
+    # Compute derived quantities
+    df['delta_baseline'] = df['cilia_f0'] - df['actuator_f0_mean']
+    df['inv_distance'] = 1 / df['mean_distance']
+    df['freq_change'] = df['cilia_f'] - df['cilia_f0']
+    df['relative_change'] = (df['cilia_f'] - df['cilia_f0']) / (2 * (df['cilia_fwidth'] + df['cilia_f0width']))
+    df['residual'] = df['cilia_f'] - df['actuator_f0_mean']
+    df['residual_sq'] = df['residual'] ** 2
+    df['effect_size'] = df['residual'] / df['delta_baseline']
+
+    # --- Plot config ---
+    plot_specs = [
+        ('freq_change', cmap_general),
+        ('relative_change', cmap_general),
+        ('residual', cmap_general),
+        ('residual_sq', cmap_general),
+        ('effect_size', cmap_general),
+        ('phase_mean', cmap_cyclic),  # new, cyclic map
+        ('phase_std', cmap_general),  # new, general map
+    ]
+
+    ncols = len(plot_specs)
+    fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 5), sharex=True, sharey=True)
+    fig.suptitle("Cilia–Actuator Frequency and Phase Relationships", fontsize=16)
+
+    for ax, (col, cmap) in zip(axes, plot_specs):
+        sc = ax.scatter(df['delta_baseline'], df['inv_distance'],
+                        c=df[col], cmap=cmap, edgecolor='black', s=60)
+        ax.set_title(col.replace('_', ' '))
+        ax.set_xlabel("Δ_baseline = cilia_f0 − actuator_f0_mean (Hz)")
+        ax.set_ylabel("1 / mean_distance (1/µm)")
+        cbar = plt.colorbar(sc, ax=ax)
+        cbar.set_label(col, rotation=270, labelpad=15)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.show()
+
+def summarize_phase_relationships(all_res):
+    """
+    Compute circular mean, std, and SEM of actuator phase at cilia minima
+    for all high (inner) segments across files.
+
+    Parameters
+    ----------
+    all_res : dict
+        Output from full_analysis() {filename: (cilia_procs, actuator_procs, psd_results)}
+
+    Returns
+    -------
+    phase_df : pd.DataFrame
+        Columns: ['filename', 'segment_index', 'mean_distance',
+                  'phase_mean', 'phase_std', 'phase_sem']
+    """
+    records = []
+
+    for filename, (cilia_procs, actuator_procs, psd_results) in all_res.items():
+        df_psd = pd.DataFrame(psd_results)
+        highs = df_psd[(df_psd['type'] == 'high') & (df_psd['target'] == 'cilia')]
+
+        for i, seg in enumerate(highs.itertuples()):
+            c_data = cilia_procs[i+1]  # +1 because index 0 is 'low' (before)
+            b_data = actuator_procs[i+1]
+
+            if b_data is None or c_data is None:
+                continue
+
+            cilia_min_times = np.asarray(c_data.get('final_t', []))
+            if len(cilia_min_times) < 2:
+                continue
+
+            b_time = np.asarray(b_data.get('time', []))
+            b_phase = np.asarray(b_data.get('phase', []))
+            if len(b_time) < 2:
+                continue
+
+            # Interpolate actuator phase at cilia minima times
+            interp_phase = interp1d(b_time, b_phase, kind='linear', bounds_error=False, fill_value='extrapolate')
+            act_phase_at_cilia_min = interp_phase(cilia_min_times)
+
+            # Wrap actuator phase to [0, 2π)
+            act_phase_wrapped = np.mod(act_phase_at_cilia_min, 2*np.pi)
+
+            # Use circular mean in radians (0..2π)
+            phase_mean = circmean(act_phase_wrapped, high=2*np.pi, low=0)
+            phase_std = circstd(act_phase_wrapped, high=2*np.pi, low=0)
+            phase_sem = phase_std / np.sqrt(len(act_phase_wrapped))
+
+            print(phase_mean)
+
+
+            records.append({
+                'filename': filename,
+                'segment_index': seg.segment_index,
+                'mean_distance': seg.mean_distance,
+                'phase_mean': phase_mean,
+                'phase_std': phase_std,
+                'phase_sem': phase_sem,
+                'n_points': len(act_phase_at_cilia_min),
+            })
+
+    phase_df = pd.DataFrame(records)
+    phase_df = phase_df.sort_values(['filename', 'mean_distance']).reset_index(drop=True)
+    return phase_df
+
 def full_analysis(filepath_pattern, show_seg_plots=True, show_PSD=True):
+    out_csv_psd = "psd_summary.csv"
+    out_csv_phase = "phase_summary.csv"
+    
     filepaths = glob.glob(filepath_pattern)
-    all_res=[]
-    for fpath in filepaths:
+    all_res={}
+    for i,fpath in enumerate(filepaths):
         df = pd.read_csv(fpath)
         filename = Path(fpath).name
 
@@ -897,10 +1238,23 @@ def full_analysis(filepath_pattern, show_seg_plots=True, show_PSD=True):
             show_PSD=show_PSD,
             std_window_size=WINDOW_LENGTH,
         )
-        all_res.append(res)
+        all_res[filename]=res
+        # if i>3:
+        #     break
     
-    #convert to csv or df or np object
+    # --- PSD summary ---
+    summary_df = summarize_psd_results(all_res)
+    summary_df.to_csv(out_csv_psd, index=False)
+    print(f"✅ Saved PSD summary to {out_csv_psd}")
+
+    # --- Phase summary ---
+    phase_df = summarize_phase_relationships(all_res)
+    phase_df.to_csv(out_csv_phase, index=False)
+    print(f"✅ Saved phase summary to {out_csv_phase}")
+
+    # Plot frequency summary
+    postprocess_summary(out_csv_psd, out_csv_phase, cmap_general='jet', cmap_cyclic='twilight')
 
 if __name__ == "__main__":
     # full_analysis("/home/max/Documents/02_Data/Cilia_project/farzin/csv_to_analyze/*.csv", show_seg_plots=True, show_PSD=True)
-    full_analysis("/home/max/Downloads/download/*.csv", show_seg_plots=False, show_PSD=True)
+    full_analysis("/home/max/Downloads/download/*.csv", show_seg_plots=False, show_PSD=False)
