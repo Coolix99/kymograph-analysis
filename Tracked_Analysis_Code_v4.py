@@ -904,7 +904,7 @@ def split_distancebased_segments(
     # --- Determine segment boundaries based on distance variation ---
     n_segments = 1
     cut_indices = []
-    while n_segments <= max_segments:
+    while n_segments < max_segments:
         split_idx = np.linspace(0, len(distance) - 1, n_segments + 1, dtype=int)
         ok = True
         for i in range(n_segments):
@@ -1125,7 +1125,8 @@ def postprocess_summary(psd_csv, phase_csv, cmap_general='jet', cmap_cyclic='twi
     df['relative_change'] = (df['cilia_f'] - df['cilia_f0']) / (2 * (df['cilia_fwidth'] + df['cilia_f0width']))
     df['residual'] = df['cilia_f'] - df['actuator_f0_mean']
     df['residual_sq'] = df['residual'] ** 2
-    df['effect_size'] = df['residual'] / df['delta_baseline']
+    reg=0.3
+    df['effect_size'] =  np.log((df['delta_baseline']**2+reg)/(df['residual']**2+reg))
 
     # --- Plot config ---
     plot_specs = [
