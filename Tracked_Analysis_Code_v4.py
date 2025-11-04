@@ -847,8 +847,8 @@ def split_distancebased_segments(
     segments,
     envelope_timescale=0.5,
     poly_order=3,
-    distance_cutoff=3.5,
-    max_segments=4,
+    distance_cutoff=5.0,
+    max_segments=2,
     debug=False
 ):
     """
@@ -1087,22 +1087,14 @@ def summarize_psd_results(all_res):
     summary_df = summary_df.sort_values(['filename', 'mean_distance']).reset_index(drop=True)
     return summary_df
 
-def postprocess_summary(psd_csv, phase_csv, cmap_general='jet', cmap_cyclic='twilight'):
-    """
-    Merge PSD and phase summaries, and plot all frequency/phase relationships.
+from scipy.stats import norm
+import math
 
-    Parameters
-    ----------
-    psd_csv : str
-        Path to PSD summary CSV (from summarize_psd_results).
-    phase_csv : str
-        Path to phase summary CSV (from summarize_phase_relationships).
-    cmap_general : str
-        Colormap for non-cyclic data (e.g. 'jet', 'viridis', 'plasma', etc.)
-    cmap_cyclic : str
-        Cyclic colormap for phase_mean (e.g. 'twilight', 'hsv', 'twilight_shifted').
+def postprocess_summary(psd_csv, phase_csv, cmap_general='jet', cmap_cyclic='twilight', ncols=5):
     """
-
+    Merge PSD and phase summaries, compute derived quantities and Gaussian-based p-values,
+    and plot all relationships in a flexible multi-row grid.
+    """
 
     # --- Load data ---
     df_psd = pd.read_csv(psd_csv)
@@ -1118,39 +1110,97 @@ def postprocess_summary(psd_csv, phase_csv, cmap_general='jet', cmap_cyclic='twi
                   how='inner',
                   suffixes=('', '_phase'))
 
-    # Compute derived quantities
+    # --- Derived quantities ---
     df['delta_baseline'] = df['cilia_f0'] - df['actuator_f0_mean']
     df['inv_distance'] = 1 / df['mean_distance']
     df['freq_change'] = df['cilia_f'] - df['cilia_f0']
     df['relative_change'] = (df['cilia_f'] - df['cilia_f0']) / (2 * (df['cilia_fwidth'] + df['cilia_f0width']))
     df['residual'] = df['cilia_f'] - df['actuator_f0_mean']
     df['residual_sq'] = df['residual'] ** 2
-    reg=0.3
-    df['effect_size'] =  np.log((df['delta_baseline']**2+reg)/(df['residual']**2+reg))
+    reg = 0.3
+    df['effect_size'] = np.log((df['delta_baseline']**2 + reg) / (df['residual']**2 + reg))
 
-    # --- Plot config ---
-    plot_specs = [
-        ('freq_change', cmap_general),
-        ('relative_change', cmap_general),
-        ('residual', cmap_general),
-        ('residual_sq', cmap_general),
-        ('effect_size', cmap_general),
-        ('phase_mean', cmap_cyclic),  # new, cyclic map
-        ('phase_std', cmap_general),  # new, general map
+    # --- Gaussian-based p-values ---
+    def gaussian_pval(mu1, sigma1, mu2, sigma2, direction=None):
+        if np.isnan(mu1) or np.isnan(mu2):
+            return np.nan
+        denom = np.sqrt(sigma1**2 + sigma2**2)
+        if denom == 0 or np.isnan(denom):
+            return np.nan
+        z = (mu1 - mu2) / denom
+        if direction == 'greater':
+            p = 1 - norm.cdf(z)
+        elif direction == 'less':
+            p = norm.cdf(z)
+        else:  # two-sided
+            p = 2 * (1 - norm.cdf(abs(z)))
+        return p
+
+    p_freq_change_dir = []
+    p_cilia0_vs_act = []
+    p_cilia_vs_act = []
+
+    for _, row in df.iterrows():
+        # a) expected direction
+        if row['actuator_f0_mean'] > row['cilia_f0']:
+            p = gaussian_pval(row['cilia_f'], row['cilia_fwidth'], row['cilia_f0'], row['cilia_f0width'], direction='greater')
+        else:
+            p = gaussian_pval(row['cilia_f'], row['cilia_fwidth'], row['cilia_f0'], row['cilia_f0width'], direction='less')
+        p_freq_change_dir.append(p)
+
+        # b) baseline vs actuator
+        p2 = gaussian_pval(row['cilia_f0'], row['cilia_f0width'], row['actuator_f0_mean'], row['actuator_f0_sem'])
+        p_cilia0_vs_act.append(p2)
+
+        # c) cilia after stimulation vs actuator
+        p3 = gaussian_pval(row['cilia_f'], row['cilia_fwidth'], row['actuator_f0_mean'], row['actuator_f0_sem'])
+        p_cilia_vs_act.append(p3)
+
+    df['p_freq_change_dir'] = p_freq_change_dir
+    df['p_cilia0_vs_act'] = p_cilia0_vs_act
+    df['p_cilia_vs_act'] = p_cilia_vs_act
+
+    # --- Plot configuration ---
+    metrics = [
+        ('freq_change', cmap_general, 'Δ freq = cilia_f − cilia_f0'),
+        ('relative_change', cmap_general, 'Relative freq change'),
+        ('residual', cmap_general, 'Cilia − Actuator (Hz)'),
+        ('residual_sq', cmap_general, 'Residual²'),
+        ('effect_size', cmap_general, 'Effect size (log ratio)'),
+        ('phase_mean', cmap_cyclic, 'Phase mean (rad)'),
+        ('phase_std', cmap_general, 'Phase std (rad)'),
+        ('p_freq_change_dir', cmap_general, 'p(freq change dir, one-sided)'),
+        ('p_cilia0_vs_act', cmap_general, 'p(cilia_f0 vs actuator)'),
+        ('p_cilia_vs_act', cmap_general, 'p(cilia_f vs actuator)'),
     ]
 
-    ncols = len(plot_specs)
-    fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 5), sharex=True, sharey=True)
+    nplots = len(metrics)
+    nrows = math.ceil(nplots / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows), sharex=True, sharey=True)
+    axes = np.array(axes).flatten()
+
     fig.suptitle("Cilia–Actuator Frequency and Phase Relationships", fontsize=16)
 
-    for ax, (col, cmap) in zip(axes, plot_specs):
-        sc = ax.scatter(df['delta_baseline'], df['inv_distance'],
-                        c=df[col], cmap=cmap, edgecolor='black', s=60)
-        ax.set_title(col.replace('_', ' '))
+    for ax, (col, cmap, title) in zip(axes, metrics):
+        sc = ax.scatter(df['delta_baseline'], df['inv_distance'], c=df[col], cmap=cmap,
+                        edgecolors='black', s=60)
+        ax.set_title(title)
         ax.set_xlabel("Δ_baseline = cilia_f0 − actuator_f0_mean (Hz)")
         ax.set_ylabel("1 / mean_distance (1/µm)")
         cbar = plt.colorbar(sc, ax=ax)
         cbar.set_label(col, rotation=270, labelpad=15)
+
+        # Mark p < 0.05 with cross (for p columns only)
+        if col.startswith('p_'):
+            sig_mask = df[col] < 0.05
+            ax.scatter(df.loc[sig_mask, 'delta_baseline'],
+                       df.loc[sig_mask, 'inv_distance'],
+                       color='red', marker='x', s=80, label='p<0.05')
+            ax.legend(loc='upper right', fontsize=8)
+
+    # hide empty slots
+    for ax in axes[nplots:]:
+        ax.set_visible(False)
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.show()
@@ -1226,32 +1276,32 @@ def full_analysis(filepath_pattern, show_seg_plots=True, show_PSD=True):
     out_csv_psd = "psd_summary.csv"
     out_csv_phase = "phase_summary.csv"
     
-    filepaths = glob.glob(filepath_pattern)
-    all_res={}
-    for i,fpath in enumerate(filepaths):
-        df = pd.read_csv(fpath)
-        filename = Path(fpath).name
+    # filepaths = glob.glob(filepath_pattern)
+    # all_res={}
+    # for i,fpath in enumerate(filepaths):
+    #     df = pd.read_csv(fpath)
+    #     filename = Path(fpath).name
 
-        res=analyze(
-            df,
-            filename,
-            show_seg_plots=show_seg_plots,
-            show_PSD=show_PSD,
-            std_window_size=WINDOW_LENGTH,
-        )
-        all_res[filename]=res
-        # if i>3:
-        #     break
+    #     res=analyze(
+    #         df,
+    #         filename,
+    #         show_seg_plots=show_seg_plots,
+    #         show_PSD=show_PSD,
+    #         std_window_size=WINDOW_LENGTH,
+    #     )
+    #     all_res[filename]=res
+    #     # if i>3:
+    #     #     break
     
-    # --- PSD summary ---
-    summary_df = summarize_psd_results(all_res)
-    summary_df.to_csv(out_csv_psd, index=False)
-    print(f"✅ Saved PSD summary to {out_csv_psd}")
+    # # --- PSD summary ---
+    # summary_df = summarize_psd_results(all_res)
+    # summary_df.to_csv(out_csv_psd, index=False)
+    # print(f"✅ Saved PSD summary to {out_csv_psd}")
 
-    # --- Phase summary ---
-    phase_df = summarize_phase_relationships(all_res)
-    phase_df.to_csv(out_csv_phase, index=False)
-    print(f"✅ Saved phase summary to {out_csv_phase}")
+    # # --- Phase summary ---
+    # phase_df = summarize_phase_relationships(all_res)
+    # phase_df.to_csv(out_csv_phase, index=False)
+    # print(f"✅ Saved phase summary to {out_csv_phase}")
 
     # Plot frequency summary
     postprocess_summary(out_csv_psd, out_csv_phase, cmap_general='jet', cmap_cyclic='twilight')
