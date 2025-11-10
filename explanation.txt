@@ -1,0 +1,76 @@
+# General
+We the tracked position of Cilia and Actuator as time series.
+First we split the time series into a part befor, during and after the actuator is active.
+This is determined automatically when position of actuatro starts/stops to change above a threshold.
+The middle part (during actuator stimulation) can be further splitted as the distance of the actuator to the cilium changes over time.
+Within each segment the mean distance of the actuator to the cilium is determined.
+
+# PSD
+For each segment (before, intermediate, after) we compute from the cilium and acturator (only for intermediate segments) the PSD.
+From the PSD we determine the peak frequency as well as its width. 
+For an initial guess we first smooth the PDS: savgol_filter(psd, smooth_win=7, poly_order=2).
+From the smoothed cuve we take the maximum position as initial guess for peak frequency and the with as width of half maximum height.
+To refine this we fit a lorenz curve with offset. 
+def peak_func(f, f0, A, gamma, offset):
+            return A / (1 + ((f - f0) / (gamma / 2))**2) + offset
+We fit this curve in the intervall f0_guess+-1.5*width_guess.
+The obtained fit value for f0 and gamma (=width) are then used further.
+
+For each intermediate segment we report mean distance, frequency of cilium without actuator and the width,
+same for actuator and frequency plus with during the actuation.
+The actuator has a very stable and well defined frequency and we can use
+actuator_f0_mean = highs_act['f0'].mean()
+actuator_f0_sem = highs_act['f0'].sem()
+where mean and sem is calculated over the 3 part before-during-after.
+For the cilum without actuator f0 we take the the mean of the peak frequency before and after as
+frequency f0 and determine the width by 
+fwidth_total = (fmax - fmin) + np.mean(width_f_i)
+which account for individual width of the frequency as well as possble drift.
+
+# p values 
+We assume the frequencies f_cilium_0, f_actuator and f_cilium are gaussian distributed around there determined peak frequency with the determined width.
+we can use 
+ def gaussian_pval(mu1, sigma1, mu2, sigma2, direction=None):
+        if np.isnan(mu1) or np.isnan(mu2):
+            return np.nan
+        denom = np.sqrt(sigma1**2 + sigma2**2)
+        if denom == 0 or np.isnan(denom):
+            return np.nan
+        z = (mu1 - mu2) / denom
+        if direction == 'greater':
+            p = 1 - norm.cdf(z)
+        elif direction == 'less':
+            p = norm.cdf(z)
+        else:  # two-sided
+            p = 2 * (1 - norm.cdf(abs(z)))
+        return p
+
+to compute the p values for two quantities with mean and sigma. Eigther two sided or one sided.
+
+We ask three questions:
+1) Has cilia frequency changed (in the right direction)?
+2) Was the frequency of the cilium before/after different from actuator frequency?
+3) Is the cilia frequency (during) different from the actuator?
+
+In case of phase locking, we would expect that for 1) the frequency has changed significantly (p small),
+2) that the frequency was initially different (p big) and 3) the frequency during the actuator influence is 
+approximately the same (p big).
+
+If 1) shows big p, the actuator has not influenced the cilium. If 2) shows small p, the PSD alone can not determine phaselocking, as the frequency is already very close.
+If 3) has small p actuator and cilium are still not at same frequency during the activation.
+
+# phase
+From the position data of actuator and cilium we can also investigate the phase difference.
+As tracking of the cilium is most precise in the local minima we determine them and observe the actuator phase stroboscopic at these time points.
+To construct actuator phase, we first reduce the drift in the actuator position by imposing a mask in fourier space (remove modes below 0.3*peak frequency and above 1.7*peak frequency).
+The filtered signal is nearly sinus shaped and we apply hilberttransform and take the angle of the result to get the protophase. 
+We apply method descibed in 
+[B. Kralemann, L. Cimponeriu, M. Rosenblum,
+A. Pikovsky, and R. Mrowka, Phase dynamics of
+coupled oscillators reconstructed from data, Phys. Rev.
+E 77, 066205 (2008).]
+to turn the protophase in a phase with constant average angular velocity.
+We collect the phase of the actuator stroboscipic when the cilium has a local minimum.
+The phase should be significantly different from uniform distribution, if we have interaction between cilium and actuator. 
+The observed circular std should be smaller for better phase locking.
+
